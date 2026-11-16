@@ -17,14 +17,10 @@
 //! `whisper-litert`, `gemma-litert` and `kokoro-litert` commands.
 
 pub mod assistant;
-pub mod backend;
-pub mod bilstm;
-pub mod compiled;
-pub mod container;
+// The runtime library's modules, under the paths this crate always had.
+pub use remotemedia_litert_runtime::{backend, bilstm, compiled, container, litert, lm};
 #[cfg(feature = "kokoro")]
 pub mod kokoro;
-pub mod litert;
-pub mod lm;
 pub mod mel;
 pub mod node;
 pub mod tokenizer;

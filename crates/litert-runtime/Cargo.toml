@@ -1,0 +1,18 @@
+[package]
+name = "remotemedia-litert-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "LiteRT (TFLite interpreter, CompiledModel) and LiteRT-LM loaded at run time, the .litertlm container and the BiLSTM custom op, for RemoteMedia nodes"
+repository = "https://github.com/RemoteMedia-SDK/litert-nodes"
+publish = false
+
+# A library only: no plugin export and no C++ build, so another plugin can
+# link it (e.g. the RAG assistant's phone-mode generation).
+[dependencies]
+serde_json = "1"
+# LiteRT and LiteRT-LM are loaded at run time (libLiteRt.so / liblitert-lm.so
+# on Android, litert-lm.dll on Windows), so nothing links them.
+libloading = "0.8"
+memmap2 = "0.9"
+matrixmultiply = { version = "0.3", features = ["threading"] }

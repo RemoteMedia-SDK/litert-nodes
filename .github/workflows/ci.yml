@@ -1,0 +1,78 @@
+name: CI
+
+# Builds and tests the plugin and the runtime library on Windows and Linux,
+# and cross-builds the plugin for Android. The plugin SDK is checked out
+# beside this repository, as in development (see README.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      plugin-sdk-ref:
+        description: 'remotemedia-plugin-sdk branch, tag or commit to build against'
+        required: false
+        default: 'main'
+
+env:
+  PLUGIN_SDK_REF: ${{ inputs.plugin-sdk-ref || 'main' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: litert-nodes
+      - uses: actions/checkout@v4
+        with:
+          repository: RemoteMedia-SDK/remotemedia-plugin-sdk
+          ref: ${{ env.PLUGIN_SDK_REF }}
+          path: remotemedia-plugin-sdk
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: fmt
+        working-directory: litert-nodes
+        run: cargo fmt --all -- --check
+      - name: test
+        working-directory: litert-nodes
+        # The real-model conformance tests skip themselves without
+        # REMOTEMEDIA_GEMMA_LITERTLM / REMOTEMEDIA_LITERT_LM_LIB.
+        run: cargo test --workspace --all-targets
+
+  android:
+    name: build (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: litert-nodes
+      - uses: actions/checkout@v4
+        with:
+          repository: RemoteMedia-SDK/remotemedia-plugin-sdk
+          ref: ${{ env.PLUGIN_SDK_REF }}
+          path: remotemedia-plugin-sdk
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: build
+        working-directory: litert-nodes
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          cargo build --release --target aarch64-linux-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liblitert-nodes-aarch64-android
+          path: litert-nodes/target/aarch64-linux-android/release/libremotemedia_litert_nodes.so

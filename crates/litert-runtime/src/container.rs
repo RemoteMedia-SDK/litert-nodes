@@ -30,9 +30,9 @@ pub struct Container {
 }
 
 /// A minimal FlatBuffer table reader: enough for this schema.
-pub(crate) struct Table<'a> {
-    pub(crate) buf: &'a [u8],
-    pub(crate) pos: usize,
+pub struct Table<'a> {
+    pub buf: &'a [u8],
+    pub pos: usize,
     vtable: usize,
 }
 
@@ -42,7 +42,7 @@ fn u16_at(b: &[u8], p: usize) -> Result<u16, String> {
         .ok_or_else(|| "flatbuffer out of bounds".into())
 }
 
-pub(crate) fn u32_at(b: &[u8], p: usize) -> Result<u32, String> {
+pub fn u32_at(b: &[u8], p: usize) -> Result<u32, String> {
     b.get(p..p + 4)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
         .ok_or_else(|| "flatbuffer out of bounds".into())
@@ -55,13 +55,13 @@ fn u64_at(b: &[u8], p: usize) -> Result<u64, String> {
 }
 
 impl<'a> Table<'a> {
-    pub(crate) fn at(buf: &'a [u8], pos: usize) -> Result<Self, String> {
+    pub fn at(buf: &'a [u8], pos: usize) -> Result<Self, String> {
         let back = u32_at(buf, pos)? as i32;
         let vtable = (pos as i64 - back as i64) as usize;
         Ok(Self { buf, pos, vtable })
     }
 
-    pub(crate) fn field(&self, index: usize) -> Result<Option<usize>, String> {
+    pub fn field(&self, index: usize) -> Result<Option<usize>, String> {
         let len = u16_at(self.buf, self.vtable)? as usize;
         let slot = 4 + 2 * index;
         if slot >= len {
@@ -71,34 +71,34 @@ impl<'a> Table<'a> {
         Ok((off != 0).then_some(self.pos + off))
     }
 
-    pub(crate) fn u8(&self, index: usize) -> Result<u8, String> {
+    pub fn u8(&self, index: usize) -> Result<u8, String> {
         Ok(match self.field(index)? {
             Some(p) => *self.buf.get(p).ok_or("flatbuffer out of bounds")?,
             None => 0,
         })
     }
 
-    pub(crate) fn u64(&self, index: usize) -> Result<u64, String> {
+    pub fn u64(&self, index: usize) -> Result<u64, String> {
         Ok(match self.field(index)? {
             Some(p) => u64_at(self.buf, p)?,
             None => 0,
         })
     }
 
-    pub(crate) fn reference(&self, index: usize) -> Result<Option<usize>, String> {
+    pub fn reference(&self, index: usize) -> Result<Option<usize>, String> {
         Ok(match self.field(index)? {
             Some(p) => Some(p + u32_at(self.buf, p)? as usize),
             None => None,
         })
     }
 
-    pub(crate) fn table(&self, index: usize) -> Result<Option<Table<'a>>, String> {
+    pub fn table(&self, index: usize) -> Result<Option<Table<'a>>, String> {
         self.reference(index)?
             .map(|p| Table::at(self.buf, p))
             .transpose()
     }
 
-    pub(crate) fn string(&self, index: usize) -> Result<Option<String>, String> {
+    pub fn string(&self, index: usize) -> Result<Option<String>, String> {
         let Some(p) = self.reference(index)? else {
             return Ok(None);
         };
@@ -110,14 +110,14 @@ impl<'a> Table<'a> {
         Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
     }
 
-    pub(crate) fn u32(&self, index: usize) -> Result<u32, String> {
+    pub fn u32(&self, index: usize) -> Result<u32, String> {
         Ok(match self.field(index)? {
             Some(p) => u32_at(self.buf, p)?,
             None => 0,
         })
     }
 
-    pub(crate) fn i32s(&self, index: usize) -> Result<Vec<i32>, String> {
+    pub fn i32s(&self, index: usize) -> Result<Vec<i32>, String> {
         let Some(p) = self.reference(index)? else {
             return Ok(Vec::new());
         };
@@ -127,7 +127,7 @@ impl<'a> Table<'a> {
             .collect()
     }
 
-    pub(crate) fn tables(&self, index: usize) -> Result<Vec<Table<'a>>, String> {
+    pub fn tables(&self, index: usize) -> Result<Vec<Table<'a>>, String> {
         let Some(p) = self.reference(index)? else {
             return Ok(Vec::new());
         };

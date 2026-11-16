@@ -180,11 +180,31 @@ needs CMake, Ninja and a C++ compiler (MSVC on Windows; the NDK's clang for
 Android, with `ANDROID_NDK_HOME` set). The first build downloads Abseil
 20260526.0 into `cpp/third_party/` (or set `ABSEIL_SOURCE_DIR`).
 
-The default `plugin` feature exports this library's node factories. Rust consumers
-embedding its engine and assistant helpers in another plugin should depend on
-this crate with `default-features = false`, so only the consumer's plugin entry
-point is exported. A standalone LiteRT plugin without Kokoro can be built with
-`--no-default-features --features plugin`.
+The repository is a Cargo workspace of two crates:
+
+- `remotemedia-litert-nodes` (this directory) is the plugin: the three
+  nodes, Kokoro's C++ phonemizer, and `plugin_export!` behind the default
+  `plugin` feature. A standalone plugin without Kokoro is built with
+  `--no-default-features --features plugin`.
+- `remotemedia-litert-runtime` (`crates/litert-runtime`) is a library with no
+  plugin export and no C++ build. It holds the LiteRT interpreter and
+  CompiledModel bindings, the LiteRT-LM engine (`lm`), the `.litertlm`
+  container and the BiLSTM op. Another plugin that runs a LiteRT model
+  depends on this crate instead of the plugin, as scaling's RAG assistant
+  does for its phone mode.
+
+`GemmaAssistantNode`'s room behavior comes from `remotemedia-room-agent` in
+[remotemedia-plugin-sdk](https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk).
+For development, the plugin SDK is a sibling checkout:
+
+```
+rm-mp/
+  litert-nodes/              this repository
+  remotemedia-plugin-sdk/    crates/plugin-sdk, crates/room-agent
+```
+
+The plugin and the host must use the same plugin SDK checkout or revision,
+so the plugin ABI matches.
 
 ```bash
 cargo build --release                                     # this host
@@ -210,6 +230,11 @@ litert-nodes/
 
 `node_types` lets a distributed runtime send the plugin only to the runners
 that run its nodes.
+
+This repository was split from `remotemedia-sdk-base/examples/litert-nodes`
+(its history is kept). A release publishes `liblitert-nodes-{arch}-{os}.{ext}`
+and `release-manifest.json`, so a manifest can name the plugin by version:
+`"plugins": ["litert-nodes@v0.1.0"]`.
 
 ## Measured
 
