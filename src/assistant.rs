@@ -30,6 +30,7 @@
 //! | `max_tokens` | 4096 | context length |
 //! | `max_reply_tokens` | 160 | |
 //! | `system_prompt` | built in | |
+//! | `conversation` | `continuous` | `continuous`: one conversation across replies, as above. `per_reply`: each reply starts a new conversation whose only prompt is the line being answered, for callers that send everything a reply needs in that line (a pipeline model reused across calls) |
 
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
@@ -63,12 +64,22 @@ const CONTEXT_HEADROOM: usize = 800;
 /// waits for the next piece.
 const CANCEL_POLL: Duration = Duration::from_millis(20);
 
+/// Whether replies share one conversation (`conversation` param).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversation {
+    /// One conversation across replies; the KV cache holds the history.
+    Continuous,
+    /// Each reply starts a new conversation, prompted with only its line.
+    PerReply,
+}
+
 #[derive(Clone, Debug)]
 pub struct AssistantConfig {
     pub lm: LmConfig,
     pub room: RoomAgentConfig,
     pub system_prompt: String,
     pub max_reply_tokens: i32,
+    pub conversation: Conversation,
 }
 
 fn default_system(name: &str) -> String {
@@ -91,11 +102,22 @@ pub fn config_from_params(params: &Value) -> Result<AssistantConfig, String> {
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| default_system(&room.name));
+    let conversation = match &params["conversation"] {
+        Value::Null => Conversation::Continuous,
+        Value::String(s) if s == "continuous" => Conversation::Continuous,
+        Value::String(s) if s == "per_reply" => Conversation::PerReply,
+        other => {
+            return Err(format!(
+                "{NODE_TYPE}: conversation must be \"continuous\" or \"per_reply\", not {other}"
+            ))
+        }
+    };
     Ok(AssistantConfig {
         lm,
         system_prompt,
         max_reply_tokens: params["max_reply_tokens"].as_i64().unwrap_or(160) as i32,
         room,
+        conversation,
     })
 }
 
@@ -122,20 +144,22 @@ struct Job {
 /// Replies from a LiteRT-LM model running on its own thread.
 pub struct LiteRtLmResponder {
     jobs: Mutex<mpsc::Sender<Job>>,
+    conversation: Conversation,
 }
 
 impl LiteRtLmResponder {
     pub fn start(config: &AssistantConfig) -> Result<Self, String> {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (lm, system, max_reply_tokens) = (
+        let (lm, system, max_reply_tokens, mode) = (
             config.lm.clone(),
             config.system_prompt.clone(),
             config.max_reply_tokens,
+            config.conversation,
         );
         std::thread::Builder::new()
             .name("litert-lm".into())
-            .spawn(move || model_thread(lm, system, max_reply_tokens, jobs_rx, ready_tx))
+            .spawn(move || model_thread(lm, system, max_reply_tokens, mode, jobs_rx, ready_tx))
             .map_err(|e| e.to_string())?;
         let runtime = ready_rx
             .recv()
@@ -143,16 +167,19 @@ impl LiteRtLmResponder {
         eprintln!("[{NODE_TYPE}] loaded {runtime}");
         Ok(Self {
             jobs: Mutex::new(jobs_tx),
+            conversation: config.conversation,
         })
     }
 }
 
 /// The model thread: one engine and conversation; replies stream back as
-/// pieces.
+/// pieces. With [`Conversation::PerReply`] every reply gets a new
+/// conversation; the engine stays loaded.
 fn model_thread(
     lm: LmConfig,
     system_prompt: String,
     max_reply_tokens: i32,
+    mode: Conversation,
     jobs: mpsc::Receiver<Job>,
     ready: mpsc::Sender<Result<String, String>>,
 ) {
@@ -172,16 +199,21 @@ fn model_thread(
         }
     };
     let _ = ready.send(Ok(engine.runtime.clone()));
-    // The conversation has had no prompt since it was started over.
-    let mut fresh = false;
+    // The conversation has had no prompt since it was started over. The
+    // first one has had none either, but a continuous conversation answers
+    // its first reply with `prompt` (the lines since the last reply are all
+    // of them), so only per-reply mode marks it.
+    let mut fresh = mode == Conversation::PerReply;
     while let Ok(job) = jobs.recv() {
         let full = conversation
             .as_ref()
             .is_some_and(|c| c.tokens() + CONTEXT_HEADROOM > engine.max_tokens);
-        if full || conversation.is_none() {
+        // A fresh conversation is unused: the first per-reply job keeps it.
+        let used = !fresh && mode == Conversation::PerReply;
+        if full || conversation.is_none() || used {
             match engine.conversation(&system_prompt) {
                 Ok(c) => {
-                    if full {
+                    if full && mode == Conversation::Continuous {
                         eprintln!("[{NODE_TYPE}] context full; started a new conversation");
                     }
                     conversation = Some(c);
@@ -267,12 +299,20 @@ impl Responder for LiteRtLmResponder {
 
     async fn respond(&self, turn: Turn<'_>, out: &mut ReplyOut<'_>) -> Result<Outcome, Error> {
         let (tx, mut rx) = futures_channel::mpsc::unbounded();
+        let (prompt, fresh_prompt) = match self.conversation {
+            Conversation::Continuous => (
+                reply_prompt(&turn.history.since_reply, turn.speaker, turn.question),
+                reply_prompt(&turn.history.recent, turn.speaker, turn.question),
+            ),
+            // The line is the whole prompt: nothing of the room is added.
+            Conversation::PerReply => (turn.question.to_string(), turn.question.to_string()),
+        };
         self.jobs
             .lock()
             .unwrap()
             .send(Job {
-                prompt: reply_prompt(&turn.history.since_reply, turn.speaker, turn.question),
-                fresh_prompt: reply_prompt(&turn.history.recent, turn.speaker, turn.question),
+                prompt,
+                fresh_prompt,
                 pieces: tx,
                 cancel: turn.cancel.clone(),
             })
@@ -365,6 +405,27 @@ mod tests {
                 .unwrap();
         assert_eq!(config.lm.model_path, "/models/g.litertlm");
         assert!(config.system_prompt.starts_with("You are Pixel,"));
+    }
+
+    #[test]
+    fn conversation_param() {
+        let parse = |v: Value| config_from_params(&json!({"model_path": "m", "conversation": v}));
+        assert_eq!(
+            config_from_params(&json!({"model_path": "m"}))
+                .unwrap()
+                .conversation,
+            Conversation::Continuous
+        );
+        assert_eq!(
+            parse(json!("continuous")).unwrap().conversation,
+            Conversation::Continuous
+        );
+        assert_eq!(
+            parse(json!("per_reply")).unwrap().conversation,
+            Conversation::PerReply
+        );
+        assert!(parse(json!("kept")).is_err());
+        assert!(parse(json!(1)).is_err());
     }
 
     #[test]
