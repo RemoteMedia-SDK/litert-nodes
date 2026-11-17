@@ -67,15 +67,23 @@ jobs:
       - uses: seanmiddleditch/gha-setup-ninja@v5
       - name: build
         working-directory: litert-nodes
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         # The `kokoro` feature compiles C++ twice: Abseil through CMake, which
         # build.rs gives the NDK toolchain file, and `cpp/` through the `cc`
         # crate, which looks for `aarch64-linux-android-clang++` on PATH unless
         # CXX_<target> names a compiler. Name the NDK's tools for `cc`, at the
         # same API level build.rs gives CMake (android-28), and link with it.
+        #
+        # The NDK path comes from the runner image's own environment. It must
+        # be read in the shell: `${{ env.X }}` only sees variables this
+        # workflow defines, so it was always empty here.
         run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
           TOOLS="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -x "$TOOLS/aarch64-linux-android28-clang++" ]; then
+            echo "::error::Android NDK not found (ANDROID_NDK_HOME='$ANDROID_NDK_HOME')"
+            exit 1
+          fi
+          echo "Using NDK $ANDROID_NDK_HOME"
           export CC_aarch64_linux_android="$TOOLS/aarch64-linux-android28-clang"
           export CXX_aarch64_linux_android="$TOOLS/aarch64-linux-android28-clang++"
           export AR_aarch64_linux_android="$TOOLS/llvm-ar"
