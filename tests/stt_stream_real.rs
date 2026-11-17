@@ -8,10 +8,14 @@
 //! cargo test --test stt_stream_real -- --ignored --nocapture
 //! ```
 //!
-//! Env (defaults are this machine's layout):
-//! - `RM_WHISPER_TFLITE`: Whisper `.tflite` (tokenizer.json beside it)
+//! Env (defaults assume the sibling-checkout layout this repository already
+//! uses for `../remotemedia-plugin-sdk`):
+//! - `RM_WHISPER_TFLITE`: Whisper `.tflite`, with `tokenizer.json` beside it
+//!   (default `../models/whisper-tiny-litert/whisper_tiny_30s_f32.tflite`)
 //! - `RM_LITERT_CPU_LIB`: LiteRT / TFLite C library for the CPU interpreter
+//!   (default: LiteRT's own library search)
 //! - `RM_STT_CLIPS_DIR`: directory with the example clips
+//!   (default `../remotemedia-sdk/examples`)
 //!
 //! LiteRT decodes with `<|notimestamps|>`, so each window comes back as one
 //! segment spanning the whole window. The stabilizer spreads those times
@@ -31,6 +35,11 @@ use remotemedia_plugin_sdk::types::Error;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// A path beside this checkout, e.g. `sibling("models")` → `../models`.
+fn sibling(path: &str) -> String {
+    format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"))
 }
 
 fn read_wav(path: &str) -> Vec<f32> {
@@ -170,15 +179,12 @@ fn stream(whisper: &LiteRtWhisper, audio: &[f32]) -> (Vec<TranscriptEvent>, Vec<
 fn lite_config() -> LiteConfig {
     let model_path = env_or(
         "RM_WHISPER_TFLITE",
-        "D:/rm-mp/models/whisper-tiny-litert/whisper_tiny_30s_f32.tflite",
+        &sibling("models/whisper-tiny-litert/whisper_tiny_30s_f32.tflite"),
     );
     let mut lite = LiteConfig::new(model_path);
     lite.accelerator = "cpu".into();
     lite.threads = 8;
-    lite.runtime_lib = Some(env_or(
-        "RM_LITERT_CPU_LIB",
-        "D:/rm-mp/models/litert-lm/litert-lm.dll",
-    ));
+    lite.runtime_lib = std::env::var("RM_LITERT_CPU_LIB").ok();
     lite
 }
 
@@ -189,7 +195,7 @@ const CLIPS: [(&str, u32); 2] = [
 ];
 
 fn load_clip(clip: &str) -> Vec<f32> {
-    let clips = env_or("RM_STT_CLIPS_DIR", "D:/rm-mp/remotemedia-sdk/examples");
+    let clips = env_or("RM_STT_CLIPS_DIR", &sibling("remotemedia-sdk/examples"));
     let mut audio = read_wav(&format!("{clips}/{clip}"));
     audio.truncate(29 * 16_000); // the model takes at most 30 s
     audio
