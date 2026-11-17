@@ -13,6 +13,7 @@
 //! | `threads` | 4 | XNNPACK threads (`cpu`) |
 //! | `language` | `en` | |
 //! | `mask` | `additive` | decoder mask encoding (`additive` or `binary`) |
+//! | `transcript_updates` | `{"mode": "off"}` | `stable` / `full`: emit the shared `delta` / `final` Json events (`remotemedia_modality::stt`) instead of Text |
 //!
 //! A model path may name an environment variable as `${NAME}`, so one
 //! manifest can point at a different location on each runner.
@@ -21,6 +22,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use remotemedia_modality::stt::{TranscriptStabilizer, TranscriptStreamingConfig};
 use remotemedia_plugin_sdk::{
     abi_stable::{
         sabi_trait::TD_Opaque,
@@ -49,6 +51,19 @@ struct Job {
 /// reentrant); turns queue for it.
 pub struct WhisperLiteRtNode {
     jobs: std::sync::Mutex<mpsc::Sender<Job>>,
+    updates: TranscriptStreamingConfig,
+    stabilizer: std::sync::Mutex<TranscriptStabilizer>,
+}
+
+/// `params.transcript_updates`, defaulting to `off`.
+pub fn transcript_updates_from_params(params: &Value) -> Result<TranscriptStreamingConfig, String> {
+    let config: TranscriptStreamingConfig = match params.get("transcript_updates") {
+        None | Some(Value::Null) => TranscriptStreamingConfig::default(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid transcript_updates: {e}"))?,
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 pub fn config_from_params(params: &Value) -> Result<WhisperConfig, String> {
@@ -98,6 +113,13 @@ pub fn config_from_params(params: &Value) -> Result<WhisperConfig, String> {
 
 impl WhisperLiteRtNode {
     pub fn start(config: WhisperConfig) -> Result<Self, String> {
+        Self::start_with_updates(config, TranscriptStreamingConfig::default())
+    }
+
+    pub fn start_with_updates(
+        config: WhisperConfig,
+        updates: TranscriptStreamingConfig,
+    ) -> Result<Self, String> {
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
         std::thread::Builder::new()
@@ -124,7 +146,26 @@ impl WhisperLiteRtNode {
         eprintln!("[{NODE_TYPE}] loaded with {runtime}");
         Ok(Self {
             jobs: std::sync::Mutex::new(jobs_tx),
+            stabilizer: std::sync::Mutex::new(TranscriptStabilizer::new(updates.clone())),
+            updates,
         })
+    }
+
+    /// Turn one utterance's transcript into what the node emits: one Text in
+    /// `off` mode, or the shared `delta` / `final` Json events otherwise.
+    fn render_utterance(&self, text: &str) -> Vec<RuntimeData> {
+        if self.updates.mode.is_off() {
+            return vec![RuntimeData::Text(text.to_string())];
+        }
+        let updates = self
+            .stabilizer
+            .lock()
+            .unwrap()
+            .finalize_text(text, remotemedia_modality::stt::HypothesisScope::Utterance);
+        updates
+            .iter()
+            .filter_map(|update| self.updates.render(update))
+            .collect()
     }
 
     async fn transcribe(&self, audio: Vec<f32>) -> Result<Transcript, Error> {
@@ -199,8 +240,12 @@ impl AsyncStreamingNode for WhisperLiteRtNode {
         if transcript.text.is_empty() {
             return Ok(0);
         }
-        callback(RuntimeData::Text(transcript.text))?;
-        Ok(1)
+        let outputs = self.render_utterance(&transcript.text);
+        let count = outputs.len();
+        for output in outputs {
+            callback(output)?;
+        }
+        Ok(count)
     }
 }
 
@@ -214,12 +259,71 @@ impl FfiNodeFactory for WhisperLiteRtFactory {
 
     fn create(&self, params: RString) -> RResult<FfiNodeBox, RString> {
         let params: Value = serde_json::from_str(params.as_str()).unwrap_or(Value::Null);
-        match config_from_params(&params).and_then(WhisperLiteRtNode::start) {
+        let started = config_from_params(&params).and_then(|config| {
+            WhisperLiteRtNode::start_with_updates(config, transcript_updates_from_params(&params)?)
+        });
+        match started {
             Ok(node) => ROk(FfiNode_TO::from_value(
                 StreamingNodeFfiAdapter::new(node),
                 TD_Opaque,
             )),
             Err(e) => RErr(format!("{NODE_TYPE}: {e}").into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(updates: TranscriptStreamingConfig) -> WhisperLiteRtNode {
+        WhisperLiteRtNode {
+            jobs: std::sync::Mutex::new(mpsc::channel().0),
+            stabilizer: std::sync::Mutex::new(TranscriptStabilizer::new(updates.clone())),
+            updates,
+        }
+    }
+
+    #[test]
+    fn off_mode_emits_one_text() {
+        let config = transcript_updates_from_params(&json!({})).unwrap();
+        let out = node(config).render_utterance("hello there");
+        assert!(matches!(out.as_slice(), [RuntimeData::Text(t)] if t == "hello there"));
+    }
+
+    #[test]
+    fn stable_mode_emits_delta_and_final_per_utterance() {
+        let config =
+            transcript_updates_from_params(&json!({"transcript_updates": {"mode": "stable"}}))
+                .unwrap();
+        let node = node(config);
+        let first = node.render_utterance("hello there");
+        let second = node.render_utterance("second one");
+        let kinds: Vec<_> = first
+            .iter()
+            .map(|d| match d {
+                RuntimeData::Json(v) => v["type"].as_str().unwrap().to_string(),
+                other => panic!("expected Json, got {}", other.data_type()),
+            })
+            .collect();
+        assert_eq!(kinds, ["delta", "final"]);
+        let RuntimeData::Json(last) = second.last().unwrap() else {
+            panic!()
+        };
+        assert_eq!(last["utterance_id"], 1);
+        assert_eq!(last["text"], "second one");
+    }
+
+    #[test]
+    fn bad_transcript_updates_is_rejected() {
+        assert!(
+            transcript_updates_from_params(&json!({"transcript_updates": {"mode": "loud"}}))
+                .is_err()
+        );
+        assert!(transcript_updates_from_params(
+            &json!({"transcript_updates": {"agreement_updates": 0}})
+        )
+        .is_err());
     }
 }
